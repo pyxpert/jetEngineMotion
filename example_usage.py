@@ -68,12 +68,20 @@ def main():
     print("\n4. 设置规划任务（3D坐标）...")
     R = surface.r_constant  # 圆柱内壁半径 900mm
     
+<<<<<<< HEAD
     # 起点：270°位置（即Y=-900的位置）
     # pyxpert要求：起始位置在圆柱底部
     theta_fixed_deg = 270  
     theta_fixed_rad = np.radians(theta_fixed_deg)
     X_start = 0
     Y_start = -900
+=======
+    # 起点：-45°位置
+    theta_start_deg = -45  # 角度：相对于X轴顺时针旋转45°
+    theta_start_rad = np.radians(theta_start_deg)
+    X_start = R * np.cos(theta_start_rad)  # ≈ 636.4 mm
+    Y_start = R * np.sin(theta_start_rad)  # ≈ -636.4 mm
+>>>>>>> 55b60340857ac6423f05bae67fcfb9e99153835f
     
     # 终点：270°位置（即Y=-900的位置）
     # 这是requirements_log中指定的目标点
