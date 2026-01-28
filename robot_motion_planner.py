@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from typing import List, Tuple, Dict, Optional
 import json
+import re
+import os
 
 
 def set_axes_equal_3d(ax):
@@ -64,7 +66,7 @@ class EngineSurface:
         self.z_min = z_min
         self.z_max = z_max
         self.r_constant = r_constant
-        self.blade_positions = blade_positions if blade_positions else [200, 400, 600, 800]
+        self.blade_positions = blade_positions if blade_positions is not None else [200, 400, 600, 800]
         
         # 生成叶片障碍物
         self.blades = self._generate_blades()
@@ -190,18 +192,31 @@ class EngineSurface:
 
 
 class Robot:
-    """双节机器人模型"""
+    """双节机器人模型
+    
+    根据PDF文档（04_21376223_刘丹阳）中的运动学模型：
+    - 机器人简化为两个可相对位移、相对旋转的三角形
+    - h: 中心电机转轴到上表面（水平面）的高度
+    - d1: 前足吸盘中心到中间电机转轴的水平距离（当a=0时）
+    - d2: 后足吸盘中心到中间电机转轴的水平距离（当a=0时）
+    - a: 直线电机行程，范围[0, s_max]
+    - φ: 机器人前进方向角（机器人所在平面与环境轴线的角度）
+    - γ: 翻折角（两节间相对转动角度）
+    """
     
     def __init__(self, L1: float = 40, W1: float = 30, 
                  L2: float = 40, W2: float = 30, 
                  h: float = 30, s_max: float = 8,
+                 d1: float = 20, d2: float = 20,
                  magnet_radius: float = 2.5, theta3_min: float = -90, theta3_max: float = 90):
         """
         初始化机器人参数（单位：mm，角度：度）
         L1, W1: 前节长宽 (40mm, 30mm)
         L2, W2: 后节长宽 (40mm, 30mm)
-        h: 电磁铁底面到每节上表面的高度 (30mm)
+        h: 中间电机转轴到上表面的高度 (30mm)
         s_max: 直线电机（丝杠）最大行程 (8mm)
+        d1: 前足吸盘中心到中间电机转轴的水平距离（当a=0时），默认L1/2=20mm
+        d2: 后足吸盘中心到中间电机转轴的水平距离（当a=0时），默认L2/2=20mm
         magnet_radius: 电磁铁半径 (mm)，默认2.5mm（直径5mm）
         theta3_min, theta3_max: 两节相对旋转角度范围 (-90° 到 90°，0°为共面)
         """
@@ -211,6 +226,8 @@ class Robot:
         self.W2 = W2
         self.h = h
         self.s_max = s_max
+        self.d1 = d1  # 前足到中间电机的水平距离
+        self.d2 = d2  # 后足到中间电机的水平距离
         self.magnet_radius = magnet_radius
         self.theta3_min = np.radians(theta3_min)  # 转换为弧度
         self.theta3_max = np.radians(theta3_max)  # 转换为弧度
@@ -242,6 +259,224 @@ class Robot:
         # 或者理解为：机器人整体会从Z=0走向Z=1000，但行进方向的"前"是Z减小方向
         # 根据目标（前足终点Z=1000），机器人需要向Z增大方向移动
         self.heading_direction = np.array([0.0, 0.0, 1.0])  # 朝向Z增大方向（移动方向）
+    
+    def calc_other_foot_position(self, fixed_foot_X: float, fixed_foot_theta: float,
+                                  phi: float, a: float, R: float,
+                                  find_front: bool = True) -> Tuple[float, float]:
+        """
+        根据PDF文档中的公式计算另一足的落点位置。
+        机器人从壁面底部出发，Y 恒为负；落点须与固定足同半圆（同 Y 符号）。
+        
+        PDF: 椭圆 y²/R² + x²/(R/sin(φ))² = 1；小圆 (2.4)(2.5)。
+        增量 ΔX = x0·cos(φ)，Δθ = arctan(x0·sin(φ)/y0)。
+        """
+        # ---------- φ≈0° 纯轴向运动：Δθ=0，ΔX=±(d1+a+d2) ----------
+        if abs(np.sin(phi)) < 0.01:  # 修正：φ≈0° 为纯轴向运动
+            d = self.d1 + a + self.d2
+            if find_front:
+                return (d, 0.0)   # 后足→前足：前足在轴向后方，ΔX>0
+            else:
+                return (-d, 0.0)  # 前足→后足：后足在轴向后方，ΔX<0
+        
+        # ---------- 一般情况：小圆与椭圆求交点 ----------
+        sin_phi = np.sin(phi) if abs(np.sin(phi)) >= 0.01 else (0.01 if phi >= 0 else -0.01)
+        a_ellipse = abs(R / sin_phi)
+        b_ellipse = R
+        
+        if find_front:
+            cx = -(self.d2 + a)
+            cy = -R + self.h
+            r_circle = np.sqrt(self.d1**2 + self.h**2)  # 修正：使用勾股定理计算实际距离
+        else:
+            cx = self.d1
+            cy = -R + self.h
+            r_circle = np.sqrt((a + self.d2)**2 + self.h**2)  # 修正：使用勾股定理计算实际距离
+        
+        # 使用解析方法求解椭圆与圆的交点
+        x0, y0 = self._solve_ellipse_circle_intersection(cx, cy, r_circle, a_ellipse, b_ellipse, 
+                                                         fixed_foot_theta, find_front)
+        
+        delta_X = x0 * np.cos(phi)
+        delta_theta = np.arctan2(x0 * np.sin(phi), y0) if abs(y0) > 0.001 else 0.0
+        return (delta_X, delta_theta)
+    
+    def _solve_ellipse_circle_intersection(self, cx, cy, r_circle, a_ellipse, b_ellipse, 
+                                           fixed_foot_theta, find_front):
+        """
+        解析求解椭圆与圆的交点
+        椭圆: x^2/a_ellipse^2 + y^2/b_ellipse^2 = 1
+        圆: (x-cx)^2 + (y-cy)^2 = r_circle^2
+        """
+        # 使用numpy求解四次方程的方法
+        # 从椭圆方程: x^2 = a_ellipse^2 * (1 - y^2/b_ellipse^2)
+        # 从圆方程: (x-cx)^2 = r_circle^2 - (y-cy)^2
+        # 所以 x = cx ± sqrt(r_circle^2 - (y-cy)^2)
+        
+        # 将x代入椭圆方程: [cx ± sqrt(r_circle^2-(y-cy)^2)]^2 = a_ellipse^2 * (1 - y^2/b_ellipse^2)
+        # 展开: cx^2 ± 2*cx*sqrt(r_circle^2-(y-cy)^2) + (r_circle^2-(y-cy)^2) = a_ellipse^2 - a_ellipse^2*y^2/b_ellipse^2
+        # 移项: ± 2*cx*sqrt(r_circle^2-(y-cy)^2) = a_ellipse^2 - a_ellipse^2*y^2/b_ellipse^2 - cx^2 - (r_circle^2-(y-cy)^2)
+        
+        # RHS = a_ellipse^2 - a_ellipse^2*y^2/b_ellipse^2 - cx^2 - r_circle^2 + (y-cy)^2
+        # RHS = a_ellipse^2 - cx^2 - r_circle^2 + cy^2 - a_ellipse^2*y^2/b_ellipse^2 + y^2 - 2*cy*y
+        # RHS = (a_ellipse^2 - cx^2 - r_circle^2 + cy^2) + y^2*(1 - a_ellipse^2/b_ellipse^2) - 2*cy*y
+        # RHS = C1 + C2*y^2 + C3*y
+        
+        C1 = a_ellipse**2 - cx**2 - r_circle**2 + cy**2
+        C2 = 1 - a_ellipse**2 / b_ellipse**2
+        C3 = -2*cy
+        
+        # LHS = ± 2*cx*sqrt(r_circle^2-(y-cy)^2)
+        # 两边平方: 4*cx^2*(r_circle^2-(y-cy)^2) = (C1 + C2*y^2 + C3*y)^2
+        # 展开右边: C1^2 + C2^2*y^4 + C3^2*y^2 + 2*C1*C2*y^2 + 2*C1*C3*y + 2*C2*C3*y^3
+        # 展开左边: 4*cx^2*(r_circle^2 - y^2 + 2*cy*y - cy^2)
+        #         = 4*cx^2*(r_circle^2 - cy^2) + 8*cx^2*cy*y - 4*cx^2*y^2
+        
+        # 方程: 4*cx^2*(r_circle^2 - cy^2) + 8*cx^2*cy*y - 4*cx^2*y^2 
+        #     = C1^2 + C2^2*y^4 + C3^2*y^2 + 2*C1*C2*y^2 + 2*C1*C3*y + 2*C2*C3*y^3
+        # 
+        # 重新整理为标准四次方程: coeff_4*y^4 + coeff_3*y^3 + coeff_2*y^2 + coeff_1*y + coeff_0 = 0
+        
+        coeff_4 = C2**2
+        coeff_3 = 2*C2*C3
+        coeff_2 = C3**2 + 2*C1*C2 - 4*cx**2  # C3^2*y^2 + 2*C1*C2*y^2 - 4*cx^2*y^2
+        coeff_1 = 2*C1*C3 - 8*cx**2*cy  # 2*C1*C3*y - 8*cx^2*cy*y
+        coeff_0 = C1**2 - 4*cx**2*(r_circle**2 - cy**2)  # C1^2 - 4*cx^2*(r^2-cy^2)
+        
+        # 使用numpy求解四次方程
+        coeffs = [coeff_4, coeff_3, coeff_2, coeff_1, coeff_0]
+        roots = np.roots(coeffs)
+        
+        # 筛选实根
+        valid_solutions = []
+        for root in roots:
+            if np.isreal(root):
+                y_val = np.real(root)
+                
+                # 检查是否满足圆方程的约束条件 (r_circle^2 - (y_val-cy)^2 >= 0)
+                under_sqrt = r_circle**2 - (y_val - cy)**2
+                if under_sqrt < 0:
+                    continue  # 不是有效解
+                    
+                sqrt_val = np.sqrt(under_sqrt)
+                
+                # 有两个x值的候选：cx ± sqrt_val
+                for sign in [1, -1]:
+                    x_candidate = cx + sign * sqrt_val
+                    
+                    # 验证是否同时满足椭圆方程
+                    ellipse_check = (x_candidate**2 / a_ellipse**2) + (y_val**2 / b_ellipse**2)
+                    ellipse_error = abs(ellipse_check - 1)
+                    
+                    if ellipse_error < 1e-6:  # 验证误差阈值
+                        # 验证圆方程
+                        circle_check = (x_candidate - cx)**2 + (y_val - cy)**2
+                        circle_error = abs(circle_check - r_circle**2)
+                        
+                        # 检查是否与固定足在同半圆（Y符号相同）
+                        fixed_sign = np.sign(np.sin(fixed_foot_theta))
+                        if fixed_sign == 0:
+                            fixed_sign = -1.0
+                        
+                        # 计算新点的角度
+                        other_theta = fixed_foot_theta  # 初始角度
+                        if abs(y_val) > 0.001:  # 避免除零
+                            # 正确计算角度变化：Δθ = arctan(x0·sin(φ)/y0)
+                            # 但我们这里先只关心y值符号
+                            pass
+                        
+                        # 检查是否在底部半圆（y < 0）
+                        if y_val < 0:  # 确保在底部半圆（Y为负）
+                            total_error = ellipse_error + circle_error
+                            valid_solutions.append((x_candidate, y_val, total_error))
+        
+        # 如果没有找到有效解，使用近似解
+        if not valid_solutions:
+            # 使用原始的迭代方法作为后备
+            return self._solve_ellipse_circle_intersection_iterative_backup(cx, cy, r_circle, a_ellipse, b_ellipse, 
+                                                                           fixed_foot_theta, find_front)
+        
+        # 选择误差最小的解
+        best_solution = min(valid_solutions, key=lambda x: x[2])
+        return best_solution[0], best_solution[1]
+
+    def _solve_ellipse_circle_intersection_iterative_backup(self, cx, cy, r_circle, a_ellipse, b_ellipse, 
+                                                           fixed_foot_theta, find_front):
+        """
+        备用的迭代方法，当解析方法失败时使用
+        """
+        fixed_sign = np.sign(np.sin(fixed_foot_theta))
+        if fixed_sign == 0:
+            fixed_sign = -1.0  # 底部 Y<0，取负
+        
+        best_x, best_y = 0.0, -a_ellipse
+        min_error = float('inf')
+        
+        for angle in np.linspace(0, 2 * np.pi, 720):  # 增加采样点提高精度
+            x = cx + r_circle * np.cos(angle)
+            y = cy + r_circle * np.sin(angle)
+            if not (y < 0 and y > -a_ellipse - 10):
+                continue
+            err = abs((x**2 / a_ellipse**2) + (y**2 / b_ellipse**2) - 1)
+            if err < min_error:
+                # 检查角度约束
+                if abs(y) < 0.001:
+                    dt = 0.0
+                else:
+                    dt = np.arctan2(x * np.sin(0.785), y)  # 使用一个示例phi值
+                other_theta = fixed_foot_theta + dt
+                other_sign = np.sign(np.sin(other_theta))
+                if other_sign == 0:
+                    other_sign = -1.0
+                if fixed_sign != other_sign:
+                    continue
+                min_error = err
+                best_x, best_y = x, y
+        
+        return best_x, best_y
+    
+    def calc_rear_foot_from_front(self, front_X: float, front_theta: float,
+                                   phi: float, a: float, R: float) -> Tuple[float, float]:
+        """
+        已知前足位置，计算后足落点位置
+        
+        参数:
+            front_X: 前足X坐标（轴向）
+            front_theta: 前足θ坐标（周向，弧度）
+            phi: 机器人前进方向角（弧度）
+            a: 直线电机行程
+            R: 圆柱半径
+        
+        返回:
+            (rear_X, rear_theta): 后足的绝对位置
+        """
+        delta_X, delta_theta = self.calc_other_foot_position(
+            front_X, front_theta, phi, a, R, find_front=False
+        )
+        rear_X = front_X + delta_X
+        rear_theta = front_theta + delta_theta
+        return rear_X, rear_theta
+    
+    def calc_front_foot_from_rear(self, rear_X: float, rear_theta: float,
+                                   phi: float, a: float, R: float) -> Tuple[float, float]:
+        """
+        已知后足位置，计算前足落点位置
+        
+        参数:
+            rear_X: 后足X坐标（轴向）
+            rear_theta: 后足θ坐标（周向，弧度）
+            phi: 机器人前进方向角（弧度）
+            a: 直线电机行程
+            R: 圆柱半径
+        
+        返回:
+            (front_X, front_theta): 前足的绝对位置
+        """
+        delta_X, delta_theta = self.calc_other_foot_position(
+            rear_X, rear_theta, phi, a, R, find_front=True
+        )
+        front_X = rear_X + delta_X
+        front_theta = rear_theta + delta_theta
+        return front_X, front_theta
     
     def get_state_code(self) -> str:
         """
@@ -386,6 +621,11 @@ class MotionPlanner:
         
         current_theta, current_z = start
         goal_theta, goal_z = goal
+        
+        # 保存可视化用起点/终点（仅当非 plan_path_3d 调用时）
+        if not hasattr(self, '_viz_front_start_z'):
+            self._viz_start = start
+            self._viz_goal = goal
         
         # 处理角度周期性
         theta_diff = goal_theta - current_theta
@@ -544,19 +784,23 @@ class MotionPlanner:
             current_z = target_z_after_blades
         
         # 现在已经穿过所有叶片，可以安全地移动到目标theta
-        # 检查是否需要周向移动
+        # 检查是否需要周向移动（纯直线运动时，theta应该严格不变）
         theta_diff = goal_theta - current_theta
         if theta_diff > np.pi:
             theta_diff -= 2 * np.pi
         elif theta_diff < -np.pi:
             theta_diff += 2 * np.pi
         
-        if abs(theta_diff) > 0.05:
+        # 对于纯直线运动，如果theta差异很小（<0.001弧度≈0.057°），直接使用goal_theta，不生成中间步骤
+        if abs(theta_diff) > 0.001:  # 约0.057°
             num_theta_steps = max(1, int(abs(theta_diff) / 0.2))
             for i in range(1, num_theta_steps + 1):
                 t = i / num_theta_steps
                 next_theta = (current_theta + theta_diff * t) % (2 * np.pi)
                 steps.append((next_theta, current_z))
+            current_theta = goal_theta
+        else:
+            # theta差异很小，直接使用goal_theta，确保纯直线运动
             current_theta = goal_theta
         
         # 最后轴向移动到目标Z
@@ -574,32 +818,23 @@ class MotionPlanner:
         
         return steps
     
-    def _generate_step_motion(self, from_theta: float, from_z: float,
-                             to_theta: float, to_z: float,
-                             front_attached: bool) -> List[Tuple[str, float]]:
+    def _generate_step_motion(self, from_theta: float, from_z: float, 
+                               to_theta: float, to_z: float, 
+                               front_attached: bool) -> List[Tuple[str, float]]:
         """
         生成从一点到另一点的交替步进运动序列
         
         根据论文（04_21376223_刘丹阳）中描述的运动逻辑：
         
-        运动顺序（每一步）：
-        1. 脱附一吸盘 
-        2. 中间电机内折（θ3从0°变化，使未吸附足抬起离开壁面）
-        3. 前/后旋转电机转动 + 直线电机推/拉（在空中完成位移）
-        4. 中间电机放下（θ3恢复到0°，使吸盘贴附壁面）
-        5. 双吸盘同时吸附
+        蠕虫式爬行（轴向移动）完整周期：
+        阶段1: 后足脱附 + 内折抬起
+        阶段2: 丝杠伸出（后足前移）
+        阶段3: 放下后足 + 双足吸附
+        阶段4: 前足脱附 + 内折抬起
+        阶段5: 丝杠收缩（前足前移）
+        阶段6: 放下前足 + 双足吸附
         
-        关键理解：
-        - θ3（翻折角γ）：用于控制未吸附节相对于吸附节的翻折，使其抬起或放下
-        - 在900mm半径的圆筒内壁，如果θ3保持90°，未吸附足距离壁面太远，无法切换吸附
-        - 正确的做法：θ3在运动过程中临时变化（抬起），在双足吸附时恢复到接近0°（两节共面）
-        
-        电机参数：
-        - ω1: 前节中心旋转电机，控制前节电磁铁相对于前节的角度（范围：-360°到360°）
-        - ω2: 后节中心旋转电机，控制后节电磁铁相对于后节的角度（范围：-360°到360°）
-        - ω3: 两节间旋转电机，控制两节相对角度θ3（范围：-90°到90°，0°=两节共面）
-        - v: 丝杠电机，控制两节间相对位移s（范围：0到s_max，即0-8mm）
-        - m1, m2: 前节和后节电磁铁
+        一个完整周期的轴向位移 ≈ 丝杠行程（最大8mm）
         
         返回: [(state_code, duration), ...]
         """
@@ -619,150 +854,193 @@ class MotionPlanner:
         v_linear = 0.5  # 线速度 (mm/s)
         
         # 翻折角度参数（单位：弧度）
-        # 在900mm半径圆筒内壁，需要一个合适的翻折角度使未吸附足能够离开壁面
-        # 但不能太大，否则无法在放下后贴附壁面
-        # 根据机器人尺寸（h=30mm），翻折30-45度左右比较合适
         theta3_fold_angle = np.radians(35)  # 翻折角度：35°
         
         # 短暂停顿时间（用于状态切换）
         pause_time = 0.5  # 秒
         
-        # ======= 一步运动的完整逻辑 =======
-        # 判断哪个节需要移动
-        if front_attached:
-            # 前节吸附，后节移动
-            m1, m2 = '1', '0'  # 前吸附，后脱附
-        else:
-            # 后节吸附，前节移动
-            m1, m2 = '0', '1'  # 前脱附，后吸附
+        # 单步丝杠行程（充分利用8mm行程，留5%裕量）
+        step_stroke = self.robot.s_max * 0.95  # ≈7.6mm
         
-        # 步骤1: 脱附一吸盘（已经在状态中体现）
-        # 初始时两个都吸附，需要先脱附一个
-        if self.current_theta3 == 0:  # 如果当前是双足吸附状态
-            # 添加一个短暂的过渡：从双足吸附到单足吸附
-            motions.append((f"0000{m1}{m2}", pause_time))
+        # =====================================================
+        # 轴向运动：蠕虫式爬行（需要完整周期）
+        # 需要循环直到完成目标位移
+        # =====================================================
+        remaining_dz = abs(dz)
+        move_forward = (dz > 0)  # 是否向Z正方向移动
         
-        # 步骤2: 中间电机内折（抬起未吸附足）
-        # θ3从当前值变化到目标翻折角度
-        # 翻折方向：通常是正向（向上翻折）
-        fold_direction = 1 if theta3_fold_angle > self.current_theta3 else 2
-        fold_delta = abs(theta3_fold_angle - self.current_theta3)
-        if fold_delta > 0.01:  # 需要翻折
-            state = f"00{fold_direction}0{m1}{m2}"  # ω3旋转，v停止
-            duration = fold_delta / omega_w3
-            motions.append((state, duration))
-            self.current_theta3 = theta3_fold_angle
+        while remaining_dz > 0.1:  # 当剩余位移大于0.1mm时继续
+            # 本次蠕虫周期的位移
+            cycle_dz = min(remaining_dz, step_stroke)
+            
+            # === 阶段1: 后足脱附 + 内折抬起 ===
+            # 脱附后足
+            motions.append(("000010", pause_time))  # M1=ON, M2=OFF
+            
+            # 内折（θ3增大，抬起后足，θ3始终为正）
+            fold_delta_rad = theta3_fold_angle - max(0.0, self.current_theta3)
+            if fold_delta_rad > 0.01:
+                duration = fold_delta_rad / omega_w3
+                motions.append(("001010", duration))  # ω3=CW, M1=ON, M2=OFF
+                self.current_theta3 = theta3_fold_angle
+            
+            # === 阶段2: 丝杠伸出（后足前移）===
+            # 前足吸附时，伸出丝杠使后足向前移动
+            if move_forward:
+                # 向Z正方向移动：伸出丝杠
+                # 尽量使用最大行程，但不超过剩余位移和可用行程
+                available_stroke = self.robot.s_max - self.current_s
+                # 优先使用step_stroke（7.6mm），但受限于available_stroke和cycle_dz
+                actual_stroke = min(step_stroke, available_stroke, cycle_dz)
+                if actual_stroke > 0.01:
+                    duration = actual_stroke / v_linear
+                    motions.append(("001110", duration))  # ω3=CW(保持), v=Fwd, M1=ON, M2=OFF
+                    self.current_s += actual_stroke
+            else:
+                # 向Z负方向移动：收缩丝杠
+                available_stroke = self.current_s
+                actual_stroke = min(cycle_dz, available_stroke, step_stroke)
+                if actual_stroke > 0.01:
+                    duration = actual_stroke / v_linear
+                    motions.append(("001210", duration))  # ω3=CW(保持), v=Rev, M1=ON, M2=OFF
+                    self.current_s -= actual_stroke
+            
+            # === 阶段3: 放下后足 + 双足吸附 ===
+            # 放下后足（θ3恢复到0°，θ3始终为正，内折方向）
+            unfold_delta_rad = max(0.0, self.current_theta3)  # 确保非负
+            if unfold_delta_rad > 0.01:
+                duration = unfold_delta_rad / omega_w3
+                motions.append(("002010", duration))  # ω3=CCW, M1=ON, M2=OFF
+                self.current_theta3 = 0.0
+            
+            # 双足吸附
+            motions.append(("000011", pause_time))  # M1=ON, M2=ON
+            
+            # === 阶段4: 前足脱附 + 内折抬起 ===
+            # 脱附前足
+            motions.append(("000001", pause_time))  # M1=OFF, M2=ON
+            
+            # 内折（θ3增大，抬起前足，θ3始终为正）
+            fold_delta_rad = theta3_fold_angle - max(0.0, self.current_theta3)
+            if fold_delta_rad > 0.01:
+                duration = fold_delta_rad / omega_w3
+                motions.append(("001001", duration))  # ω3=CW, M1=OFF, M2=ON
+                self.current_theta3 = theta3_fold_angle
+            
+            # === 阶段5: 丝杠收缩（前足前移）===
+            # 后足吸附时，收缩丝杠使前足向前移动
+            actual_stroke_phase5 = 0.0
+            if move_forward:
+                # 向Z正方向移动：收缩丝杠，前足被"拉"向后足
+                # 尽量使用最大行程，但不超过剩余位移和可用行程
+                available_stroke = self.current_s
+                # 优先使用step_stroke（7.6mm），但受限于available_stroke和cycle_dz
+                actual_stroke_phase5 = min(step_stroke, available_stroke, cycle_dz)
+                if actual_stroke_phase5 > 0.01:
+                    duration = actual_stroke_phase5 / v_linear
+                    motions.append(("002201", duration))  # ω3=CCW(放下), v=Rev, M1=OFF, M2=ON
+                    self.current_s -= actual_stroke_phase5
+            else:
+                # 向Z负方向移动：伸出丝杠
+                available_stroke = self.robot.s_max - self.current_s
+                actual_stroke_phase5 = min(cycle_dz, available_stroke, step_stroke)
+                if actual_stroke_phase5 > 0.01:
+                    duration = actual_stroke_phase5 / v_linear
+                    motions.append(("002101", duration))  # ω3=CCW(放下), v=Fwd, M1=OFF, M2=ON
+                    self.current_s += actual_stroke_phase5
+            
+            # === 阶段6: 放下前足 + 双足吸附 ===
+            # 放下前足（θ3恢复到0°，θ3始终为正，内折方向）
+            unfold_delta_rad = max(0.0, self.current_theta3)  # 确保非负
+            if unfold_delta_rad > 0.01:
+                duration = unfold_delta_rad / omega_w3
+                motions.append(("002001", duration))  # ω3=CCW, M1=OFF, M2=ON
+                self.current_theta3 = 0.0
+            
+            # 双足吸附
+            motions.append(("000011", pause_time))  # M1=ON, M2=ON
+            
+            # 更新剩余位移（每个完整周期移动 actual_stroke_phase5）
+            # 一个完整的蠕虫周期：后足前移 + 前足前移 ≈ 2 * stroke
+            # 但由于我们交替吸附，实际前进距离约等于一个stroke
+            remaining_dz -= actual_stroke_phase5 if actual_stroke_phase5 > 0 else cycle_dz
+            
+            # 安全保护：防止无限循环
+            if len(motions) > 2000:
+                break
         
-        # 步骤3: 前/后旋转电机转动 + 直线电机推/拉
-        # 3a: 周向运动（通过ω1或ω2旋转实现）
-        if abs(dtheta) > 0.001:
-            # 周向运动通过旋转电机ω1或ω2实现
-            # 哪个节吸附，就用那个节的旋转电机
+        # =====================================================
+        # 周向运动：通过ω1或ω2旋转实现
+        # 注意：纯直线蠕动（dtheta≈0）时跳过此部分
+        # =====================================================
+        if abs(dtheta) > 0.01:  # 增大阈值，避免微小角度误差触发旋转
             if front_attached:
-                # 前节吸附，通过ω1旋转使机器人在周向移动
-                # 实际上是后节绕前节电磁铁旋转
+                # 前节吸附，后节移动
+                # 先脱附后足
+                motions.append(("000010", pause_time))
+                
+                # 内折抬起后足（θ3增大，始终为正）
+                fold_delta_rad = theta3_fold_angle - max(0.0, self.current_theta3)
+                if fold_delta_rad > 0.01:
+                    duration = fold_delta_rad / omega_w3
+                    motions.append(("001010", duration))
+                    self.current_theta3 = theta3_fold_angle
+                
+                # ω1旋转（周向移动）
                 rotate_dir = '1' if dtheta > 0 else '2'
-                state = f"{rotate_dir}010{m1}{m2}"  # ω1旋转
                 duration = abs(dtheta) / omega_w1w2
-                motions.append((state, duration))
+                motions.append((f"{rotate_dir}01010", duration))  # ω1旋转, ω3保持, M1=ON, M2=OFF
                 if dtheta > 0:
                     self.current_theta1 += np.degrees(dtheta)
                 else:
                     self.current_theta1 -= np.degrees(abs(dtheta))
+                
+                # 放下后足（θ3恢复到0°，始终为正）
+                unfold_delta_rad = max(0.0, self.current_theta3)
+                if unfold_delta_rad > 0.01:
+                    duration = unfold_delta_rad / omega_w3
+                    motions.append(("002010", duration))
+                    self.current_theta3 = 0.0
+                
+                # 双足吸附
+                motions.append(("000011", pause_time))
             else:
-                # 后节吸附，通过ω2旋转使机器人在周向移动
+                # 后节吸附，前节移动
+                # 先脱附前足
+                motions.append(("000001", pause_time))
+                
+                # 内折抬起前足（θ3增大，始终为正）
+                fold_delta_rad = theta3_fold_angle - max(0.0, self.current_theta3)
+                if fold_delta_rad > 0.01:
+                    duration = fold_delta_rad / omega_w3
+                    motions.append(("001001", duration))
+                    self.current_theta3 = theta3_fold_angle
+                
+                # ω2旋转（周向移动）
                 rotate_dir = '1' if dtheta > 0 else '2'
-                state = f"0{rotate_dir}00{m1}{m2}"  # ω2旋转
                 duration = abs(dtheta) / omega_w1w2
-                motions.append((state, duration))
+                motions.append((f"0{rotate_dir}1001", duration))  # ω2旋转, ω3保持, M1=OFF, M2=ON
                 if dtheta > 0:
                     self.current_theta2 += np.degrees(dtheta)
                 else:
                     self.current_theta2 -= np.degrees(abs(dtheta))
-        
-        # 3b: 轴向运动（通过直线电机v实现）
-        if abs(dz) > 0.001:
-            move_forward = (dz > 0)  # 是否向Z增大方向移动
-            remaining_dz = abs(dz)
-            
-            # 蠕虫式爬行
-            while remaining_dz > 0.1:
-                step_move = min(remaining_dz, self.robot.s_max * 0.8)
                 
-                if front_attached:
-                    # 前节吸附，后节移动
-                    if move_forward:
-                        # 伸出丝杠，后节向前（Z增大）
-                        target_ds = min(self.robot.s_max - self.current_s, step_move)
-                        if target_ds > 0.01:
-                            state = f"0010{m1}{m2}"  # v=1(伸出)
-                            duration = target_ds / v_linear
-                            motions.append((state, duration))
-                            self.current_s += target_ds
-                    else:
-                        # 缩回丝杠，后节向后（Z减小）
-                        target_ds = min(self.current_s, step_move)
-                        if target_ds > 0.01:
-                            state = f"0020{m1}{m2}"  # v=2(缩回)
-                            duration = target_ds / v_linear
-                            motions.append((state, duration))
-                            self.current_s -= target_ds
-                else:
-                    # 后节吸附，前节移动
-                    if move_forward:
-                        # 缩回丝杠，前节向前（Z增大）
-                        target_ds = min(self.current_s, step_move)
-                        if target_ds > 0.01:
-                            state = f"0020{m1}{m2}"  # v=2(缩回)
-                            duration = target_ds / v_linear
-                            motions.append((state, duration))
-                            self.current_s -= target_ds
-                            remaining_dz -= target_ds
-                        elif self.current_s < 0.1:
-                            # s接近0，需要切换吸附状态
-                            break  # 退出当前循环，将在下一步处理
-                    else:
-                        # 伸出丝杠，前节向后（Z减小）
-                        target_ds = min(self.robot.s_max - self.current_s, step_move)
-                        if target_ds > 0.01:
-                            state = f"0010{m1}{m2}"  # v=1(伸出)
-                            duration = target_ds / v_linear
-                            motions.append((state, duration))
-                            self.current_s += target_ds
-                            remaining_dz -= target_ds
+                # 放下前足（θ3恢复到0°，始终为正）
+                unfold_delta_rad = max(0.0, self.current_theta3)
+                if unfold_delta_rad > 0.01:
+                    duration = unfold_delta_rad / omega_w3
+                    motions.append(("002001", duration))
+                    self.current_theta3 = 0.0
                 
-                # 如果前节吸附完成了后节移动，计入总位移
-                if front_attached and move_forward:
-                    # 后节移动不直接计入前足位移，但为下一步做准备
-                    pass
-                
-                # 限制循环次数
-                if len(motions) > 200:
-                    break
-                    
-                # 如果已完成单步移动量，退出
-                if front_attached:
-                    break  # 前节吸附阶段只做一次伸缩
+                # 双足吸附
+                motions.append(("000011", pause_time))
         
-        # 步骤4: 中间电机放下（θ3恢复到0°，使吸盘贴附壁面）
-        # θ3从翻折状态恢复到0°（两节共面）
-        if abs(self.current_theta3) > 0.01:
-            unfold_direction = 2 if self.current_theta3 > 0 else 1  # 反向恢复
-            unfold_delta = abs(self.current_theta3)
-            state = f"00{unfold_direction}0{m1}{m2}"  # ω3旋转
-            duration = unfold_delta / omega_w3
-            motions.append((state, duration))
-            self.current_theta3 = 0.0  # 恢复到两节共面
-        
-        # 步骤5: 双吸盘同时吸附
-        motions.append(("000011", pause_time))  # 两磁铁都吸附，所有电机停止
+        # 如果没有运动（dz和dtheta都很小），保持当前状态
+        if not motions:
+            motions.append(("000011", pause_time))
         
         # 限制s在有效范围内
         self.current_s = max(0, min(self.robot.s_max, self.current_s))
-        
-        # 如果没有运动，保持当前状态
-        if not motions:
-            motions.append(("000011", pause_time))
         
         # 验证状态码符合约束
         validated_motions = []
@@ -822,18 +1100,22 @@ class MotionPlanner:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(self.get_plan_output(), f, indent=2, ensure_ascii=False)
     
-    def save_plan_table(self, filename: str):
+    def save_plan_table(self, filename: str, viz_path: Optional[str] = None):
         """
-        保存规划结果为制表符分隔的文本文件
+        保存规划结果为制表符分隔的文本文件，并据此更新运动轨迹可视化图。
+        
         包含每一步运动完成后各电机的位置状态
-        以及吸附电磁铁在三维圆柱内壁的位置坐标
+        以及吸附电磁铁在三维圆柱内壁的位置坐标。
+        若提供 viz_path（或使用默认 motion_plan_visualization.png），
+        会在保存表格后根据 motion_plan_table 重绘并保存该图像。
         
         电机位置范围：
         - θ1, θ2: -360° 到 360°（ω1, ω2旋转电机）
         - θ3: -90° 到 90°（中间旋转电机）
         - s: 0 到 8mm（直线电机）
         
-        filename: 输出文件名
+        filename: 表格输出文件名
+        viz_path: 可视化图保存路径；默认 'motion_plan_visualization.png'，传 '' 可跳过更新
         """
         with open(filename, 'w', encoding='utf-8') as f:
             # 写入文件头部说明
@@ -912,6 +1194,12 @@ class MotionPlanner:
             
             cumulative_time = 0.0
             
+            # 初始化前进方向角φ和上一步吸附的脚
+            phi_deg = 90.0  # 初始前进方向角（沿Z轴正方向）
+            last_attached_foot = 'rear'  # 初始假设后足吸附，前足在前方
+            last_v_stroke = 0.0        # 上一段v运动产生的轴向位移 (mm)
+            last_v_moving_foot = None  # 上一段v运动时移动的足 'front'|'rear'
+            
             # 写入初始状态（第0步）- 初始时两个电磁铁都吸附
             init_magnet_pos = f"M1:({front_foot_x:.1f},{front_foot_y:.1f},{front_foot_z:.1f}); M2:({rear_foot_x:.1f},{rear_foot_y:.1f},{rear_foot_z:.1f})"
             f.write(f"0\t------\t-\t-\t-\t-\t1\t1\t0.000\t0.000\t{theta1:.1f}\t{theta2:.1f}\t{theta3:.1f}\t{s_pos:.2f}\t{init_magnet_pos}\tInitial State (Both Attached)\n")
@@ -940,11 +1228,13 @@ class MotionPlanner:
                 elif w2 == '2':
                     theta2 -= omega_w1w2 * duration
                 
-                # ω3旋转
+                # ω3旋转（θ3始终为正，内折方向）
                 if w3 == '1':
                     theta3 += omega_w3 * duration
                 elif w3 == '2':
                     theta3 -= omega_w3 * duration
+                # 确保θ3始终在[0, 90]范围内
+                theta3 = max(0.0, min(90.0, theta3))
                 
                 # v直线运动
                 # s表示两节之间的相对位移，范围0到s_max
@@ -954,15 +1244,19 @@ class MotionPlanner:
                 # 当后节吸附、前节脱附时(m1=0,m2=1)：v=1使前节远离后节(s增大)，v=2使前节靠近后节(s减小)
                 if v == '1':
                     s_pos += v_linear * duration
+                    last_v_stroke = v_linear * duration
+                    last_v_moving_foot = 'rear' if m1 == '1' else 'front'
                 elif v == '2':
                     s_pos -= v_linear * duration
+                    last_v_stroke = v_linear * duration
+                    last_v_moving_foot = 'rear' if m1 == '1' else 'front'
                 
                 # 限制电机位置在有效范围内
                 # θ1, θ2: -360° 到 360°
                 theta1 = max(-360.0, min(360.0, theta1))
                 theta2 = max(-360.0, min(360.0, theta2))
-                # θ3: -90° 到 90°
-                theta3 = max(-90.0, min(90.0, theta3))
+                # θ3: 0° 到 90°（始终为正，内折方向）
+                theta3 = max(0.0, min(90.0, theta3))
                 # s: 0 到 s_max(8mm)
                 s_pos = max(0.0, min(s_max, s_pos))
                 
@@ -973,73 +1267,100 @@ class MotionPlanner:
                     # 双足吸附且ω3停止，意味着机器人已经完成一步，θ3应该接近0°
                     theta3 = 0.0
                 
-                # 更新机器人足部在圆柱内壁上的位置
-                # 蠕虫式运动：吸附的足固定，脱附的足移动
-                # 轴向移动量取决于丝杠运动
-                delta_z = v_linear * duration  # 轴向位移增量
-                
-                # 蠕虫爬行向Z增大方向前进的逻辑（根据_generate_step_motion）：
-                # 阶段1: m1=1(前足吸附), m2=0, v=1(丝杠伸展) → 后足向前足靠近（后足Z增大）
-                # 阶段2: m1=0, m2=1(后足吸附), v=2(丝杠收缩) → 前足向前推进（前足Z增大）
+                # ======================================================================
+                # 根据PDF文档中的运动学公式计算足部位置
+                # 
+                # 关键公式（PDF 04_21376223_刘丹阳）：
+                # - 椭圆方程(2.3): y²/R² + x²/(R/sin(φ))² = 1
+                # - 小圆方程(2.4): 已知后足求前足 (x+d2+a)²+(y+R-h)²=(d1+h)²
+                # - 小圆方程(2.5): 已知前足求后足 (x-d1)²+(y+R-h)²=(a+d2+h)²
+                # - 位置增量(2.6): ΔX = x₀·cos(φ)
+                # - 位置增量(2.7): Δθ = arctan(x₀·sin(φ)/y₀)
                 #
-                # 注意：在阶段2，虽然s减小，但因为后足已经在新位置固定，
-                # 丝杠收缩实际上是把前节向前"推"出去，所以前足Z增大
+                # 姿态参数：
+                # - φ: 前进方向角（机器人所在平面与轴线的角度），由θ1/θ2旋转改变
+                # - a: 直线电机行程，由v运动改变
+                # - γ: 翻折角，由θ3运动改变
+                #
+                # 当一足吸附、另一足脱附时，整个机器人绕吸附足旋转
+                # 当θ3使未吸附足"放下"时，该足落点由当前的φ和a决定
+                # ======================================================================
                 
+                # 获取机器人参数
+                d1 = self.robot.d1  # 前足到中间电机的距离 (mm)
+                d2 = self.robot.d2  # 后足到中间电机的距离 (mm)
+                h = self.robot.h    # 中间电机到上表面的高度 (mm)
+                
+                # 跟踪前进方向角φ的变化
+                # 初始φ = 90°（沿Z轴正方向前进）
+                # θ1旋转时（前足吸附），φ += Δθ1
+                # θ2旋转时（后足吸附），φ += Δθ2
+                
+                # 跟踪前进方向角φ的变化
+                # 初始φ = 90°（沿Z轴正方向前进）
+                # θ1旋转时（前足吸附），φ += Δθ1
+                # θ2旋转时（后足吸附），φ += Δθ2
+                
+                # 根据电机旋转更新前进方向角φ
                 if m1 == '1' and m2 == '0':
-                    # 前足吸附，后足脱附
-                    if v == '1':
-                        # 丝杠伸展(s增大)，后足向前足方向移动（后足Z增大）
-                        rear_foot_z += delta_z
-                    elif v == '2':
-                        # 丝杠收缩(s减小)，后足远离前足（后足Z减小）- 反向爬行
-                        rear_foot_z -= delta_z
-                    # 后足的X,Y跟随前足在同一周向位置
-                    rear_foot_x = front_foot_x
-                    rear_foot_y = front_foot_y
+                    # 前足吸附
+                    if w1 == '1':
+                        phi_deg += omega_w1w2 * duration
+                    elif w1 == '2':
+                        phi_deg -= omega_w1w2 * duration
+                    last_attached_foot = 'front'
                     
                 elif m1 == '0' and m2 == '1':
-                    # 后足吸附，前足脱附
-                    if v == '2':
-                        # 丝杠收缩(s减小)，前足被推向前（前足Z增大）- 正向爬行的关键步骤
-                        front_foot_z += delta_z
-                    elif v == '1':
-                        # 丝杠伸展(s增大)，前足被拉向后（前足Z减小）- 反向爬行
-                        front_foot_z -= delta_z
-                    # 前足的X,Y跟随后足在同一周向位置
-                    front_foot_x = rear_foot_x
-                    front_foot_y = rear_foot_y
+                    # 后足吸附
+                    if w2 == '1':
+                        phi_deg += omega_w1w2 * duration
+                    elif w2 == '2':
+                        phi_deg -= omega_w1w2 * duration
+                    last_attached_foot = 'rear'
                 
-                # 注意：ω3旋转是两节之间的翻折角度变化，不影响足部在圆柱内壁上的位置
-                # 周向运动是通过ω1或ω2旋转电机实现的，而不是ω3
-                # 因此这里不需要根据w3来更新足部的周向位置
+                # 关键：位置更新逻辑
+                phi_rad = np.radians(phi_deg)
+                a = s_pos  # 当前直线电机行程
                 
-                # 周向运动（通过ω1或ω2控制）
-                omega_w1w2_rad = np.radians(omega_w1w2)  # 转为弧度/秒
-                delta_theta = omega_w1w2_rad * duration  # 周向角度变化
+                # 1. 丝杠运动阶段：更新移动足的位置
+                if m1 == '1' and m2 == '0' and v != '0':  # 前足吸附，后足移动
+                    delta_X, delta_theta = self.robot.calc_other_foot_position(
+                        fixed_foot_X=front_foot_z, fixed_foot_theta=np.arctan2(front_foot_y, front_foot_x),
+                        phi=phi_rad, a=a, R=R, find_front=False
+                    )
+                    rear_foot_x = R * np.cos(np.arctan2(front_foot_y, front_foot_x) + delta_theta)
+                    rear_foot_y = R * np.sin(np.arctan2(front_foot_y, front_foot_x) + delta_theta)
+                    rear_foot_z = front_foot_z + delta_X
+                    
+                elif m1 == '0' and m2 == '1' and v != '0':  # 后足吸附，前足移动
+                    delta_X, delta_theta = self.robot.calc_other_foot_position(
+                        fixed_foot_X=rear_foot_z, fixed_foot_theta=np.arctan2(rear_foot_y, rear_foot_x),
+                        phi=phi_rad, a=a, R=R, find_front=True
+                    )
+                    front_foot_x = R * np.cos(np.arctan2(rear_foot_y, rear_foot_x) + delta_theta)
+                    front_foot_y = R * np.sin(np.arctan2(rear_foot_y, rear_foot_x) + delta_theta)
+                    front_foot_z = rear_foot_z + delta_X
                 
-                if w1 != '0':
-                    # ω1旋转：前节吸附时，整个机器人绕前足周向旋转
-                    if m1 == '1':
-                        # 前足固定，后足周向移动
-                        current_theta = np.arctan2(rear_foot_y, rear_foot_x)
-                        if w1 == '1':
-                            current_theta -= delta_theta  # 顺时针
-                        else:
-                            current_theta += delta_theta  # 逆时针
-                        rear_foot_x = R * np.cos(current_theta)
-                        rear_foot_y = R * np.sin(current_theta)
-                
-                if w2 != '0':
-                    # ω2旋转：后节吸附时，整个机器人绕后足周向旋转
-                    if m2 == '1':
-                        # 后足固定，前足周向移动
-                        current_theta = np.arctan2(front_foot_y, front_foot_x)
-                        if w2 == '1':
-                            current_theta -= delta_theta  # 顺时针
-                        else:
-                            current_theta += delta_theta  # 逆时针
-                        front_foot_x = R * np.cos(current_theta)
-                        front_foot_y = R * np.sin(current_theta)
+                # 2. 双足吸附阶段：精确校准刚放下的足的位置
+                if m1 == '1' and m2 == '1' and w3 == '0':
+                    if last_attached_foot == 'front':
+                        delta_X, delta_theta = self.robot.calc_other_foot_position(
+                            fixed_foot_X=front_foot_z, fixed_foot_theta=np.arctan2(front_foot_y, front_foot_x),
+                            phi=phi_rad, a=a, R=R, find_front=False
+                        )
+                        rear_foot_z = front_foot_z + delta_X
+                        rear_theta_rad = np.arctan2(front_foot_y, front_foot_x) + delta_theta
+                        rear_foot_x = R * np.cos(rear_theta_rad)
+                        rear_foot_y = R * np.sin(rear_theta_rad)
+                    elif last_attached_foot == 'rear':
+                        delta_X, delta_theta = self.robot.calc_other_foot_position(
+                            fixed_foot_X=rear_foot_z, fixed_foot_theta=np.arctan2(rear_foot_y, rear_foot_x),
+                            phi=phi_rad, a=a, R=R, find_front=True
+                        )
+                        front_foot_z = rear_foot_z + delta_X
+                        front_theta_rad = np.arctan2(rear_foot_y, rear_foot_x) + delta_theta
+                        front_foot_x = R * np.cos(front_theta_rad)
+                        front_foot_y = R * np.sin(front_theta_rad)
                 
                 # 限制Z坐标在有效范围内
                 front_foot_z = max(0.0, min(1000.0, front_foot_z))
@@ -1113,6 +1434,29 @@ class MotionPlanner:
                 f.write("All motor positions are within safe range.\n")
             
             f.write("=" * 200 + "\n")
+        
+        # 每次保存运动逻辑后自动更新 motion_plan_visualization 图像
+        out_viz = viz_path if viz_path is not None else 'motion_plan_visualization.png'
+        if out_viz and hasattr(self, '_viz_start') and hasattr(self, '_viz_goal'):
+            try:
+                front_z = getattr(self, '_viz_front_start_z', None)
+                rear_z = getattr(self, '_viz_rear_start_z', None)
+                goal_z = getattr(self, '_viz_front_goal_z', None)
+                fig = visualize_plan(
+                    self,
+                    self.surface,
+                    self._viz_start,
+                    self._viz_goal,
+                    front_start_z=front_z,
+                    rear_start_z=rear_z,
+                    front_goal_z=goal_z,
+                    table_path=filename,
+                )
+                fig.savefig(out_viz, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                print(f"已更新可视化: {out_viz}")
+            except Exception as e:
+                print(f"更新可视化失败: {e}")
     
     def load_plan(self, filename: str):
         """加载规划结果"""
@@ -1679,169 +2023,222 @@ def visualize_robot_state(robot: Robot, theta3: float, s: float, title: str = ""
     return fig
 
 
+def parse_motion_plan_table(filename: str) -> Optional[List[Dict]]:
+    """
+    解析 motion_plan_table.txt，提取每步的吸附状态与磁铁位置。
+
+    返回:
+        若解析成功则返回 List[Dict]，每项含:
+        - step: int
+        - m1_on: bool
+        - m2_on: bool
+        - m1_xyz: (x,y,z) 或 None
+        - m2_xyz: (x,y,z) 或 None
+        否则返回 None。
+    """
+    if not os.path.isfile(filename):
+        return None
+    pat_m1 = re.compile(r'M1:\(([-\d.]+),([-\d.]+),([-\d.]+)\)')
+    pat_m2 = re.compile(r'M2:\(([-\d.]+),([-\d.]+),([-\d.]+)\)')
+    rows = []
+    found_header = False
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.rstrip('\n')
+                if not line.strip():
+                    continue
+                if 'Step\tState\t' in line and 'Attached Magnet Position' in line:
+                    found_header = True
+                    continue
+                if found_header and 'Summary' in line:
+                    break
+                if found_header and line.strip().startswith('---'):
+                    continue
+                if found_header and re.match(r'^\d+\t', line):
+                    parts = line.split('\t')
+                    if len(parts) < 15:
+                        continue
+                    try:
+                        step = int(parts[0])
+                        m1_on = (parts[6].strip() == '1')
+                        m2_on = (parts[7].strip() == '1')
+                        pos_str = parts[14] if len(parts) > 14 else ''
+                    except (IndexError, ValueError):
+                        continue
+                    m1_xyz = None
+                    m2_xyz = None
+                    if 'M1:(' in pos_str:
+                        m = pat_m1.search(pos_str)
+                        if m:
+                            m1_xyz = (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+                    if 'M2:(' in pos_str:
+                        m = pat_m2.search(pos_str)
+                        if m:
+                            m2_xyz = (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+                    rows.append({
+                        'step': step, 'm1_on': m1_on, 'm2_on': m2_on,
+                        'm1_xyz': m1_xyz, 'm2_xyz': m2_xyz,
+                    })
+    except Exception:
+        return None
+    return rows if rows else None
+
+
 def visualize_plan(planner: MotionPlanner, surface: EngineSurface, 
                    start: Tuple[float, float], goal: Tuple[float, float],
                    front_start_z: float = None, rear_start_z: float = None,
-                   front_goal_z: float = None):
+                   front_goal_z: float = None,
+                   table_path: str = None):
     """
-    可视化规划结果
-    
+    可视化规划结果。优先根据 motion_plan_table 中的吸附磁铁位置绘制足端轨迹。
+
     参数:
         planner: 运动规划器
         surface: 发动机表面模型
         start: 前足起始点表面坐标 (theta, z)
         goal: 前足终点表面坐标 (theta, z)
-        front_start_z: 前足起始Z坐标（可选，默认使用start[1]）
-        rear_start_z: 后足起始Z坐标（可选，默认比前足小40mm）
-        front_goal_z: 前足终点Z坐标（可选，默认使用goal[1]）
-    
-    注意：
-        - 前后足在物理上不能处于同一位置
-        - 初始时前足和后足有一定距离（由机器人长度决定）
-        - 前足到达终点后即视为运动过程结束
+        front_start_z: 前足起始Z坐标（可选）
+        rear_start_z: 后足起始Z坐标（可选）
+        front_goal_z: 前足终点Z坐标（可选）
+        table_path: motion_plan_table.txt 路径（可选，默认 'motion_plan_table.txt'）
+
+    说明:
+        - 若存在 table_path 且解析成功，则按表中每步 M1/M2 吸附位置绘制前足/后足轨迹。
+        - 否则回退到 path_points 或简化直线路径。
     """
     fig = plt.figure(figsize=(14, 6))
     
-    # 3D可视化
     ax1 = fig.add_subplot(121, projection='3d')
-    # 只显示底部半圆，便于查看机器人在Y=-900mm处的运动轨迹
     surface.visualize(ax1, show_bottom_only=True)
     
-    # 设置前后足的起始位置
-    # 前足起始位置
-    front_start_theta = start[0]
-    front_z_start = front_start_z if front_start_z is not None else start[1]
+    table_file = table_path or 'motion_plan_table.txt'
+    rows = parse_motion_plan_table(table_file)
+    use_table = (rows is not None and len(rows) > 0)
     
-    # 后足起始位置（比前足Z坐标小，即在前足"后面"）
-    # 根据需求：前足Z=40mm，后足Z=0mm，相距40mm
-    rear_start_theta = start[0]  # 同一周向位置
-    rear_z_start = rear_start_z if rear_start_z is not None else (front_z_start - 40)
-    
-    # 确保后足Z坐标不为负
-    rear_z_start = max(0, rear_z_start)
-    
-    # 前足目标终点位置
-    front_goal_theta = goal[0]
-    front_z_goal = front_goal_z if front_goal_z is not None else goal[1]
-    
-    # 重置机器人状态
-    planner.robot.theta1 = 0.0
-    planner.robot.theta2 = 0.0
-    planner.robot.theta3 = 0.0
-    planner.robot.s = 0.0
-    planner.robot.pos_theta = start[0]
-    planner.robot.pos_z = start[1]
-    
-    # 使用planner的path_points来获取避障后的实际路径
-    # path_points包含了完整的路径点序列，包括周向绕行
-    # 注意：path_points的第一个点应该是起点(start_theta, start_z)，最后一个点是终点
-    
-    if hasattr(planner, 'path_points') and len(planner.path_points) > 0:
-        # 前足轨迹直接使用path_points
-        # path_points[0] = (start_theta, 40)，这是前足起始点
-        # path_points[-1] = (goal_theta, 1000)，这是前足终点
-        front_foot_theta = []
-        front_foot_z = []
-        for theta, z in planner.path_points:
-            front_foot_theta.append(theta)
-            front_foot_z.append(z)
+    if use_table:
+        # 按步序收集吸附落点，只记录位置发生变化的步骤（新落点）
+        front_path_xyz = []
+        rear_path_xyz = []
+        last_front_pos = None
+        last_rear_pos = None
+        tolerance = 0.1  # 位置变化容差（mm）
         
-        # 后足跟随前足，保持一定距离（约40mm）
-        # 后足起始点: Z=0 (rear_z_start)
-        rear_foot_theta = []
-        rear_foot_z = []
-        foot_distance = front_z_start - rear_z_start  # 前后足间距 = 40 - 0 = 40mm
-        for theta, z in planner.path_points:
-            # 后足的z坐标比前足小foot_distance
-            rear_z = max(0, z - foot_distance)
-            rear_foot_theta.append(theta)
-            rear_foot_z.append(rear_z)
+        for r in rows:
+            # 前足：M1=ON 且位置发生变化时记录
+            if r['m1_on'] and r['m1_xyz']:
+                if last_front_pos is None:
+                    # 第一个前足位置
+                    front_path_xyz.append(r['m1_xyz'])
+                    last_front_pos = r['m1_xyz']
+                else:
+                    # 检查位置是否变化
+                    dx = abs(r['m1_xyz'][0] - last_front_pos[0])
+                    dy = abs(r['m1_xyz'][1] - last_front_pos[1])
+                    dz = abs(r['m1_xyz'][2] - last_front_pos[2])
+                    if dx > tolerance or dy > tolerance or dz > tolerance:
+                        front_path_xyz.append(r['m1_xyz'])
+                        last_front_pos = r['m1_xyz']
+            
+            # 后足：M2=ON 且位置发生变化时记录
+            if r['m2_on'] and r['m2_xyz']:
+                if last_rear_pos is None:
+                    # 第一个后足位置
+                    rear_path_xyz.append(r['m2_xyz'])
+                    last_rear_pos = r['m2_xyz']
+                else:
+                    # 检查位置是否变化
+                    dx = abs(r['m2_xyz'][0] - last_rear_pos[0])
+                    dy = abs(r['m2_xyz'][1] - last_rear_pos[1])
+                    dz = abs(r['m2_xyz'][2] - last_rear_pos[2])
+                    if dx > tolerance or dy > tolerance or dz > tolerance:
+                        rear_path_xyz.append(r['m2_xyz'])
+                        last_rear_pos = r['m2_xyz']
+        
+        # 转换为2D表面坐标
+        front_foot_theta = [np.arctan2(p[1], p[0]) for p in front_path_xyz]
+        front_foot_z = [p[2] for p in front_path_xyz]
+        rear_foot_theta = [np.arctan2(p[1], p[0]) for p in rear_path_xyz]
+        rear_foot_z = [p[2] for p in rear_path_xyz]
+        
+        # 转换为3D绘图坐标：(X,Y,Z) -> (Z, X, Y)
+        front_path_x_3d = [p[2] for p in front_path_xyz]
+        front_path_y_3d = [p[0] for p in front_path_xyz]
+        front_path_z_3d = [p[1] for p in front_path_xyz]
+        rear_path_x_3d = [p[2] for p in rear_path_xyz]
+        rear_path_y_3d = [p[0] for p in rear_path_xyz]
+        rear_path_z_3d = [p[1] for p in rear_path_xyz]
     else:
-        # 如果没有path_points，使用简化的直线路径
-        front_foot_theta = [front_start_theta, goal[0]]
-        front_foot_z = [front_z_start, front_z_goal]
-        rear_foot_theta = [rear_start_theta, goal[0]]
-        rear_foot_z = [rear_z_start, front_z_goal - 40]
+        front_start_theta = start[0]
+        front_z_start = front_start_z if front_start_z is not None else start[1]
+        rear_start_theta = start[0]
+        rear_z_start = rear_start_z if rear_start_z is not None else max(0, front_z_start - 40)
+        front_goal_theta = goal[0]
+        front_z_goal = front_goal_z if front_goal_z is not None else goal[1]
+        if hasattr(planner, 'path_points') and len(planner.path_points) > 0:
+            front_foot_theta = []
+            front_foot_z = []
+            for theta, z in planner.path_points:
+                front_foot_theta.append(theta)
+                front_foot_z.append(z)
+            rear_foot_theta = []
+            rear_foot_z = []
+            fd = front_z_start - rear_z_start
+            for theta, z in planner.path_points:
+                rear_foot_theta.append(theta)
+                rear_foot_z.append(max(0, z - fd))
+        else:
+            front_foot_theta = [front_start_theta, front_goal_theta]
+            front_foot_z = [front_z_start, front_z_goal]
+            rear_foot_theta = [rear_start_theta, front_goal_theta]
+            rear_foot_z = [rear_z_start, max(0, front_z_goal - 40)]
+        front_path_x_3d = []
+        front_path_y_3d = []
+        front_path_z_3d = []
+        for theta, z_orig in zip(front_foot_theta, front_foot_z):
+            r = surface.get_radius(z_orig)
+            xo, yo = r * np.cos(theta), r * np.sin(theta)
+            front_path_x_3d.append(z_orig)
+            front_path_y_3d.append(xo)
+            front_path_z_3d.append(yo)
+        rear_path_x_3d = []
+        rear_path_y_3d = []
+        rear_path_z_3d = []
+        for theta, z_orig in zip(rear_foot_theta, rear_foot_z):
+            r = surface.get_radius(z_orig)
+            xo, yo = r * np.cos(theta), r * np.sin(theta)
+            rear_path_x_3d.append(z_orig)
+            rear_path_y_3d.append(xo)
+            rear_path_z_3d.append(yo)
     
-    # 绘制前足轨迹（蓝色）
-    # 3D图坐标映射：
-    # - 3D图X轴 = 原始Z（轴向，范围0-1000mm）
-    # - 3D图Y轴 = 原始X（径向X坐标，r*cos(theta)）
-    # - 3D图Z轴 = 原始Y（径向Y坐标，r*sin(theta)）
-    
-    # 固定的起点和终点位置（用户要求）
-    # 前足起点: 3D(40, 0, -900)，前足终点: 3D(1000, 0, -900)
-    # 后足起点: 3D(0, 0, -900)，后足终点: 3D(960, 0, -900)
-    
-    front_path_x_3d = [40]  # 从固定起点开始
-    front_path_y_3d = [0]
-    front_path_z_3d = [-900]
-    
-    for theta, z_orig in zip(front_foot_theta, front_foot_z):
-        r = surface.get_radius(z_orig)
-        x_orig = r * np.cos(theta)
-        y_orig = r * np.sin(theta)
-        front_path_x_3d.append(z_orig)  # 轴向Z -> 3D X轴
-        front_path_y_3d.append(x_orig)  # 径向X -> 3D Y轴
-        front_path_z_3d.append(y_orig)  # 径向Y -> 3D Z轴
-    
-    # 添加固定终点
-    front_path_x_3d.append(1000)
-    front_path_y_3d.append(0)
-    front_path_z_3d.append(-900)
-    
+    # 绘制轨迹
     if len(front_path_x_3d) > 1:
-        ax1.plot(front_path_x_3d, front_path_y_3d, front_path_z_3d, 
-                'b-', linewidth=2, label='Front Foot Path', alpha=0.8)
-    
-    # 绘制后足轨迹（橙色）
-    rear_path_x_3d = [0]  # 从固定起点开始
-    rear_path_y_3d = [0]
-    rear_path_z_3d = [-900]
-    
-    for theta, z_orig in zip(rear_foot_theta, rear_foot_z):
-        r = surface.get_radius(z_orig)
-        x_orig = r * np.cos(theta)
-        y_orig = r * np.sin(theta)
-        rear_path_x_3d.append(z_orig)
-        rear_path_y_3d.append(x_orig)
-        rear_path_z_3d.append(y_orig)
-    
-    # 添加固定终点
-    rear_path_x_3d.append(960)
-    rear_path_y_3d.append(0)
-    rear_path_z_3d.append(-900)
-    
+        ax1.plot(front_path_x_3d, front_path_y_3d, front_path_z_3d,
+                 'b-', linewidth=2, label='Front Foot Path', alpha=0.8)
     if len(rear_path_x_3d) > 1:
-        ax1.plot(rear_path_x_3d, rear_path_y_3d, rear_path_z_3d, 
-                'orange', linewidth=2, label='Rear Foot Path', alpha=0.8)
+        ax1.plot(rear_path_x_3d, rear_path_y_3d, rear_path_z_3d,
+                 'orange', linewidth=2, label='Rear Foot Path', alpha=0.8)
     
-    # 绘制起点和终点标记 - 固定在用户要求的位置
-    # 用户要求的位置（3D坐标映射：X轴=Z轴向, Y轴=原始X, Z轴=原始Y）：
+    # 固定起点和终点标记（用户要求的位置）
     # 前足起点: (X=0, Y=-900, Z=40) -> 3D(40, 0, -900)
-    # 后足起点: (X=0, Y=-900, Z=0) -> 3D(0, 0, -900)
-    # 前足终点: (X=0, Y=-900, Z=1000) -> 3D(1000, 0, -900)
-    # 后足终点: (X=0, Y=-900, Z=960) -> 3D(960, 0, -900)
-    
-    # 前足起点（绿色圆点）- 固定位置 X=0, Y=-900, Z=40
     ax1.scatter([40], [0], [-900], 
                c='green', s=100, marker='o', 
-               label=f'Start (Front) X=0,Y=-900,Z=40', edgecolors='black')
+               label='Start (Front) X=0,Y=-900,Z=40', edgecolors='black')
     
-    # 前足终点（红色星号）- 固定位置 X=0, Y=-900, Z=1000
+    # 前足终点: (X=0, Y=-900, Z=1000) -> 3D(1000, 0, -900)
     ax1.scatter([1000], [0], [-900], 
                c='red', s=150, marker='*', 
-               label=f'Goal (Front) X=0,Y=-900,Z=1000', edgecolors='black')
+               label='Goal (Front) X=0,Y=-900,Z=1000', edgecolors='black')
     
-    # 后足起点（青绿色三角形）- 固定位置 X=0, Y=-900, Z=0
+    # 后足起点: (X=0, Y=-900, Z=0) -> 3D(0, 0, -900)
     ax1.scatter([0], [0], [-900], 
                c='lime', s=80, marker='^', 
-               label=f'Start (Rear) X=0,Y=-900,Z=0', edgecolors='black')
+               label='Start (Rear) X=0,Y=-900,Z=0', edgecolors='black')
     
-    # 后足终点（橙色菱形）- 固定位置 X=0, Y=-900, Z=960
+    # 后足终点: (X=0, Y=-900, Z=960) -> 3D(960, 0, -900)
     ax1.scatter([960], [0], [-900], 
                c='darkorange', s=80, marker='D', 
-               label=f'End (Rear) X=0,Y=-900,Z=960', edgecolors='black')
+               label='End (Rear) X=0,Y=-900,Z=960', edgecolors='black')
     
     ax1.set_xlabel('Axial (Z)')
     ax1.set_ylabel('Radial X')
@@ -1964,12 +2361,3 @@ if __name__ == "__main__":
     plt.savefig('robot_state_theta3_-45_s_max.png', dpi=150, bbox_inches='tight')
     print("状态2图像已保存到 robot_state_theta3_-45_s_max.png")
     plt.close(fig_state2)
-    
-    # 可视化运动规划
-    print("\n生成运动规划可视化...")
-    fig = visualize_plan(planner, surface, start, goal)
-    plt.savefig('motion_plan_visualization.png', dpi=150)
-    print("可视化结果已保存到 motion_plan_visualization.png")
-    print("正在显示交互式窗口，您可以通过鼠标旋转、缩放查看3D图像...")
-    print("关闭窗口后程序将继续运行")
-    plt.show()  # 显示交互式窗口，支持鼠标旋转查看

@@ -17,12 +17,12 @@ def main():
         z_min=0,          # 轴向起始位置 (mm)
         z_max=1000,       # 轴向结束位置 (mm) - 圆柱内壁总长度1000mm
         r_constant=900.0, # 内表面恒定半径 (mm)
-        blade_positions=[200, 400, 600, 800]  # 四级叶片位置 (mm)
+        blade_positions=[]  # 去掉所有叶片障碍物
     )
     print(f"   表面范围: z=[{surface.z_min}, {surface.z_max}] mm")
     print(f"   圆柱内壁总长度: {surface.z_max - surface.z_min} mm")
     print(f"   内表面半径: {surface.r_constant} mm (恒定)")
-    print(f"   叶片级数: {len(surface.blade_positions)} 级")
+    print(f"   叶片级数: {len(surface.blade_positions)} 级（无障碍物）")
     print(f"   叶片位置: {surface.blade_positions} mm")
     print(f"   叶片障碍物总数: {len(surface.blades)}")
     
@@ -36,8 +36,8 @@ def main():
         h=30,               # 电磁铁底面到上表面高度 (mm)
         s_max=8,            # 直线电机最大行程 (mm)
         magnet_radius=2.5,  # 电磁铁半径 (mm)，直径5mm
-        theta3_min=-90,     # 两节相对旋转最小角度 (度)
-        theta3_max=90       # 两节相对旋转最大角度 (度)
+        theta3_min=0,       # 两节相对旋转最小角度 (度)，0°为共面
+        theta3_max=180      # 两节相对旋转最大角度 (度)，增大为内折
     )
     print(f"   前节尺寸: {robot.L1} x {robot.W1} mm")
     print(f"   后节尺寸: {robot.L2} x {robot.W2} mm")
@@ -55,28 +55,36 @@ def main():
     # - Z: 轴向坐标，范围0-1000mm
     # - 角度θ：相对于X轴正方向，从Z轴正方向看去顺时针为负
     # 
-    # 本次任务：机器人从-45°位置（X轴顺时针旋转45°）沿Z轴正方向直线前进
-    # 位置计算：θ = -45°
+    # 本次任务：机器人从-45°位置移动到270°位置（Y=-900），同时Z从40移动到1000
+    # 起点位置：θ = -45°（即315°）
     #   X = R × cos(-45°) = 900 × 0.7071 ≈ 636.4 mm
     #   Y = R × sin(-45°) = 900 × (-0.7071) ≈ -636.4 mm
+    # 终点位置：θ = 270°（即-90°）
+    #   X = R × cos(270°) = 0 mm
+    #   Y = R × sin(270°) = -900 mm
     # 
-    # 前足起始：(636.4, -636.4, 40)，后足起始：(636.4, -636.4, 0)
-    # 前足终点：(636.4, -636.4, 1000)
-    # 机器人沿Z轴正方向蠕虫式前进（纯轴向移动，无周向移动）
+    # 机器人需要同时进行周向移动（从315°到270°，即-45°的周向变化）和轴向移动（从40到1000mm）
     
     print("\n4. 设置规划任务（3D坐标）...")
-    # -45°位置的X、Y坐标
     R = surface.r_constant  # 圆柱内壁半径 900mm
-    theta_deg = -45  # 角度：相对于X轴顺时针旋转45°
-    theta_rad = np.radians(theta_deg)
-    X_pos = R * np.cos(theta_rad)  # ≈ 636.4 mm
-    Y_pos = R * np.sin(theta_rad)  # ≈ -636.4 mm
+    
+    # 起点：270°位置（即Y=-900的位置）
+    # pyxpert要求：起始位置在圆柱底部
+    theta_fixed_deg = 270  
+    theta_fixed_rad = np.radians(theta_fixed_deg)
+    X_start = 0
+    Y_start = -900
+    
+    # 终点：270°位置（即Y=-900的位置）
+    # 这是requirements_log中指定的目标点
+    X_goal = 0
+    Y_goal = -900
     
     # 起点3D坐标
-    front_start = (X_pos, Y_pos, 40)   # 前足起始点
-    rear_start = (X_pos, Y_pos, 0)     # 后足起始点
+    front_start = (X_start, Y_start, 40)   # 前足起始点
+    rear_start = (X_start, Y_start, 0)     # 后足起始点
     # 终点3D坐标
-    front_goal = (X_pos, Y_pos, 1000)  # 前足终点
+    front_goal = (X_goal, Y_goal, 1000)    # 前足终点：(0, -900, 1000)
     
     print(f"   前足起始点: X={front_start[0]}, Y={front_start[1]}, Z={front_start[2]} mm")
     print(f"   后足起始点: X={rear_start[0]}, Y={rear_start[1]}, Z={rear_start[2]} mm")
@@ -84,8 +92,11 @@ def main():
     print(f"   移动距离: {front_goal[2] - front_start[2]} mm (轴向)")
     
     # 转换为表面坐标用于规划
-    start_theta, start_z = planner.xyz_to_surface_coords(*front_start)
-    goal_theta, goal_z = planner.xyz_to_surface_coords(*front_goal)
+    # 确保 theta 严格一致
+    start_theta = theta_fixed_rad
+    goal_theta = theta_fixed_rad
+    start_z = 40.0
+    goal_z = 1000.0
     
     start = (start_theta, start_z)
     goal = (goal_theta, goal_z)
@@ -134,6 +145,7 @@ def main():
     output_file_table = 'motion_plan_table.txt'
     planner.save_plan_table(output_file_table)
     print(f"   表格格式已保存到: {output_file_table}")
+    # save_plan_table 会根据运动逻辑自动更新 motion_plan_visualization.png
     
     # 8. 可视化机器人结构
     try:
@@ -228,8 +240,8 @@ def show_initial_state_3d():
         h=30,               # 电磁铁底面到上表面高度 (mm)
         s_max=8,            # 直线电机最大行程 (mm)
         magnet_radius=2.5,  # 电磁铁半径 (mm)，直径5mm
-        theta3_min=-90,     # 两节相对旋转最小角度 (度)
-        theta3_max=90       # 两节相对旋转最大角度 (度)
+        theta3_min=0,       # 两节相对旋转最小角度 (度)，0°为共面
+        theta3_max=180      # 两节相对旋转最大角度 (度)，增大为内折
     )
     
     # 初始状态：θ3 = 0°, s = 0mm
